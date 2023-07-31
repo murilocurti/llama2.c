@@ -3,6 +3,7 @@ Inference for Llama-2 Transformer model in pure C.
 
 Example compile: (see README for more details)
 $ gcc -O3 -o run run.c -lm
+$ gcc -shared -o lib.so lib.c -lm
 
 Then run with:
 $ ./run
@@ -20,62 +21,10 @@ $ ./run
 #include <unistd.h>
 #include <sys/mman.h>
 #endif
+
+#include "lib.h"
 // ----------------------------------------------------------------------------
 // Transformer and RunState structs, and related memory management
-
-typedef struct
-{
-    int dim;        // transformer dimension
-    int hidden_dim; // for ffn layers
-    int n_layers;   // number of layers
-    int n_heads;    // number of query heads
-    int n_kv_heads; // number of key/value heads (can be < query heads because of multiquery)
-    int vocab_size; // vocabulary size, usually 256 (byte-level)
-    int seq_len;    // max sequence length
-} Config;
-
-typedef struct
-{
-    // token embedding table
-    float *token_embedding_table; // (vocab_size, dim)
-    // weights for rmsnorms
-    float *rms_att_weight; // (layer, dim) rmsnorm weights
-    float *rms_ffn_weight; // (layer, dim)
-    // weights for matmuls
-    float *wq; // (layer, dim, dim)
-    float *wk; // (layer, dim, dim)
-    float *wv; // (layer, dim, dim)
-    float *wo; // (layer, dim, dim)
-    // weights for ffn
-    float *w1; // (layer, hidden_dim, dim)
-    float *w2; // (layer, dim, hidden_dim)
-    float *w3; // (layer, hidden_dim, dim)
-    // final rmsnorm
-    float *rms_final_weight; // (dim,)
-    // freq_cis for RoPE relatively positional embeddings
-    float *freq_cis_real; // (seq_len, dim/2)
-    float *freq_cis_imag; // (seq_len, dim/2)
-    // (optional) classifier weights for the logits, on the last layer
-    float *wcls;
-} TransformerWeights;
-
-typedef struct
-{
-    // current wave of activations
-    float *x;      // activation at current time stamp (dim,)
-    float *xb;     // same, but inside a residual branch (dim,)
-    float *xb2;    // an additional buffer just for convenience (dim,)
-    float *hb;     // buffer for hidden dimension in the ffn (hidden_dim,)
-    float *hb2;    // buffer for hidden dimension in the ffn (hidden_dim,)
-    float *q;      // query (dim,)
-    float *k;      // key (dim,)
-    float *v;      // value (dim,)
-    float *att;    // buffer for scores/attention values (n_heads, seq_len)
-    float *logits; // output logits
-    // kv cache
-    float *key_cache;   // (layer, seq_len, dim)
-    float *value_cache; // (layer, seq_len, dim)
-} RunState;
 
 void malloc_run_state(RunState *s, Config *p)
 {
@@ -92,6 +41,7 @@ void malloc_run_state(RunState *s, Config *p)
     s->logits = calloc(p->vocab_size, sizeof(float));
     s->key_cache = calloc(p->n_layers * p->seq_len * p->dim, sizeof(float));
     s->value_cache = calloc(p->n_layers * p->seq_len * p->dim, sizeof(float));
+
     // ensure all mallocs went fine
     if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q || !s->k || !s->v || !s->att || !s->logits || !s->key_cache || !s->value_cache)
     {
@@ -167,13 +117,16 @@ void rmsnorm(float *o, float *x, float *weight, int size)
 {
     // calculate sum of squares
     float ss = 0.0f;
+
     for (int j = 0; j < size; j++)
     {
         ss += x[j] * x[j];
     }
+
     ss /= size;
     ss += 1e-5f;
     ss = 1.0f / sqrtf(ss);
+
     // normalize and scale
     for (int j = 0; j < size; j++)
     {
@@ -192,6 +145,7 @@ void softmax(float *x, int size)
             max_val = x[i];
         }
     }
+
     // exp and sum
     float sum = 0.0f;
     for (int i = 0; i < size; i++)
@@ -199,6 +153,7 @@ void softmax(float *x, int size)
         x[i] = expf(x[i] - max_val);
         sum += x[i];
     }
+
     // normalize
     for (int i = 0; i < size; i++)
     {
@@ -211,7 +166,9 @@ void matmul(float *xout, float *x, float *w, int n, int d)
     // W (d,n) @ x (n,) -> xout (d,)
     // by far the most amount of time is spent inside this little function
     int i;
+
 #pragma omp parallel for private(i)
+
     for (i = 0; i < d; i++)
     {
         float val = 0.0f;
@@ -225,6 +182,12 @@ void matmul(float *xout, float *x, float *w, int n, int d)
 
 void transformer(int token, int pos, Config *p, RunState *s, TransformerWeights *w)
 {
+    // printf("debug tranformer call\n");
+    // printf("token: %d\n", token);
+    // printf("pos: %d\n", pos);
+    // printf("config address %p\n", p);
+    // printf("runstate address %p\n", s);
+    // printf("weights address %p\n", w);
 
     // a few convenience variables
     float *x = s->x;
@@ -234,6 +197,22 @@ void transformer(int token, int pos, Config *p, RunState *s, TransformerWeights 
 
     // copy the token embedding into x
     float *content_row = &(w->token_embedding_table[token * dim]);
+
+    // printf("lets2.1");
+    // // Print the values of dim and pointers before memcpy
+    // printf("Before memcpy:\n");
+    // printf("dim: %d\n", dim);
+    // printf("x pointer: %p\n", (void *)x);
+    // printf("content_row pointer: %p\n", (void *)content_row);
+
+    // Print some elements of content_row to verify its contents
+    // printf("content_row contents:\n");
+    // for (int i = 0; i < dim; i++)
+    // {
+    //     printf("content_row[%d]: %d\n", i, content_row[i]);
+    // }
+
+    // return;
     memcpy(x, content_row, dim * sizeof(*x));
 
     // pluck out the "pos" row of freq_cis_real and freq_cis_imag
@@ -371,6 +350,7 @@ int sample(float *probabilities, int n)
     // sample index from probabilities, they must sum to 1
     float r = (float)rand() / (float)RAND_MAX;
     float cdf = 0.0f;
+
     for (int i = 0; i < n; i++)
     {
         cdf += probabilities[i];
@@ -379,6 +359,7 @@ int sample(float *probabilities, int n)
             return i;
         }
     }
+
     return n - 1; // in case of rounding errors
 }
 
@@ -387,6 +368,7 @@ int argmax(float *v, int n)
     // return argmax of v in elements 0..n
     int max_i = 0;
     float max_p = v[0];
+
     for (int i = 1; i < n; i++)
     {
         if (v[i] > max_p)
@@ -395,6 +377,7 @@ int argmax(float *v, int n)
             max_p = v[i];
         }
     }
+
     return max_i;
 }
 
@@ -407,34 +390,14 @@ long time_in_ms()
     return time.tv_sec * 1000 + time.tv_nsec / 1000000;
 }
 
-int main(int argc, char *argv[])
+GeneratorContext *initialize(GeneratorParams *params)
 {
+    GeneratorContext *context = malloc(sizeof(GeneratorContext));
 
-    // poor man's C argparse
-    char *checkpoint = NULL;  // e.g. out/model.bin
-    float temperature = 0.0f; // e.g. 1.0, or 0.0
-    int steps = 24;           // max number of steps to run for, 0: use seq_len
-    // 'checkpoint' is necessary arg
-    if (argc < 2)
-    {
-        printf("Usage: %s <checkpoint_file> [temperature] [steps]\n", argv[0]);
-        return 1;
-    }
-    if (argc >= 2)
-    {
-        checkpoint = argv[1];
-    }
-    if (argc >= 3)
-    {
-        // optional temperature. 0.0 = (deterministic) argmax sampling. 1.0 = baseline
-        temperature = atof(argv[2]);
-    }
-    if (argc >= 4)
-    {
-        steps = atoi(argv[3]);
-    }
+    // Copy your initialization code here
+    context->temperature = params->temperature >= 0 ? params->temperature : 0.9;
+    context->steps = params->steps > 0 ? params->steps : 256;
 
-    // seed rng with time. if you want deterministic behavior use temperature 0.0
     srand((unsigned int)time(NULL));
 
     // read in the model.bin file
@@ -443,18 +406,25 @@ int main(int argc, char *argv[])
     int fd = 0;         // file descriptor for memory mapping
     float *data = NULL; // memory mapped data pointer
     long file_size;     // size of the checkpoint file in bytes
+
     {
-        FILE *file = fopen(checkpoint, "rb");
+        FILE *file = fopen(params->checkpoint, "rb");
+
         if (!file)
         {
-            printf("Couldn't open file %s\n", checkpoint);
-            return 1;
+            printf("Couldn't open file %s\n", params->checkpoint);
+
+            return NULL;
         }
+
         // read in the config header
         if (fread(&config, sizeof(Config), 1, file) != 1)
         {
-            return 1;
+            printf("Couldn't read config\n");
+
+            return NULL;
         }
+
         // negative vocab size is hacky way of signaling unshared weights. bit yikes.
         int shared_weights = config.vocab_size > 0 ? 1 : 0;
         config.vocab_size = abs(config.vocab_size);
@@ -463,116 +433,209 @@ int main(int argc, char *argv[])
         file_size = ftell(file);  // get the file size, in bytes
         fclose(file);
         // memory map the Transformer weights into the data pointer
-        fd = open(checkpoint, O_RDONLY); // open in read only mode
+        fd = open(params->checkpoint, O_RDONLY); // open in read only mode
+
         if (fd == -1)
         {
             printf("open failed!\n");
-            return 1;
+
+            return NULL;
         }
+
         data = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+
         if (data == MAP_FAILED)
         {
             printf("mmap failed!\n");
-            return 1;
+
+            return NULL;
         }
+
         float *weights_ptr = data + sizeof(Config) / sizeof(float);
         checkpoint_init_weights(&weights, &config, weights_ptr, shared_weights);
     }
-    // right now we cannot run for more than config.seq_len steps
-    if (steps <= 0 || steps > config.seq_len)
-    {
-        steps = config.seq_len;
-    }
 
-    // read in the tokenizer.bin file
     char **vocab = (char **)malloc(config.vocab_size * sizeof(char *));
     {
         FILE *file = fopen("tokenizer.bin", "rb");
         if (!file)
         {
             printf("Couldn't load tokenizer.bin\n");
-            return 1;
+            return NULL;
         }
         int len;
         for (int i = 0; i < config.vocab_size; i++)
         {
             if (fread(&len, sizeof(int), 1, file) != 1)
             {
-                return 1;
+                return NULL;
             }
             vocab[i] = (char *)malloc(len + 1);
             if (fread(vocab[i], len, 1, file) != 1)
             {
-                return 1;
+                return NULL;
             }
             vocab[i][len] = '\0'; // add the string terminating token
         }
         fclose(file);
     }
 
-    // create and init the application RunState
     RunState state;
+
     malloc_run_state(&state, &config);
 
-    // the current position we are in
-    long start = 0; // used to time our code, only initialized after first iteration
+    context->state = state;
+    context->config = config;
+    context->weights = weights;
+    context->vocab = vocab;
+
+    context->token = 1;
+    context->pos = 0;
+    context->start = 0;
+
+    return context;
+}
+
+char *next_token(GeneratorContext *context)
+{
+    // printf("\rGenerating token 1 %d/%d\n", context->pos, context->steps);
     int next;
-    int token = 1; // 1 = BOS token in Llama-2 sentencepiece
-    int pos = 0;
-    printf("<s>\n"); // explicit print the initial BOS token (=1), stylistically symmetric
-    while (pos < steps)
+
+    // printf("debug transfromer call");
+    // printf("token: %d\n", context->token);
+    // printf("pos: %d\n", context->pos);
+    // printf("config: %d\n", context->config);
+    // printf("state: %d\n", context->state);
+    // printf("weights: %d\n", context->weights);
+
+    // printf("debug tranformer call\n");
+    // printf("token: %d\n", context->token);
+    // printf("pos: %d\n", context->pos);
+    // printf("config.dim: %d\n", context->config.dim);
+    // printf("config.hidden_dim: %d\n", context->config.hidden_dim);
+    // printf("config.n_layers: %d\n", context->config.n_layers);
+    // printf("config.n_heads: %d\n", context->config.n_heads);
+    // printf("config.n_kv_heads: %d\n", context->config.n_kv_heads);
+    // printf("config.vocab_size: %d\n", context->config.vocab_size);
+    // printf("config.seq_len: %d\n", context->config.seq_len);
+    // printf("state.x: %f\n", context->state.x);
+    // printf("state.xb: %f\n", context->state.xb);
+    // printf("state.xb2: %f\n", context->state.xb2);
+    // printf("state.hb: %f\n", context->state.hb);
+    // printf("state.hb2: %f\n", context->state.hb2);
+    // printf("state.q: %f\n", context->state.q);
+    // printf("state.k: %f\n", context->state.k);
+    // printf("state.v: %f\n", context->state.v);
+    // printf("state.att: %f\n", context->state.att);
+    // printf("state.logits: %f\n", context->state.logits);
+    // printf("state.key_cache: %f\n", context->state.key_cache);
+    // printf("state.value_cache: %f\n", context->state.value_cache);
+    // printf("weights.token_embedding_table: %f\n", context->weights.token_embedding_table);
+    // printf("weights.rms_att_weight: %f\n", context->weights.rms_att_weight);
+    // printf("weights.wq: %f\n", context->weights.wq);
+    // printf("weights.wk: %f\n", context->weights.wk);
+    // printf("weights.wv: %f\n", context->weights.wv);
+    // printf("weights.wo: %f\n", context->weights.wo);
+    // printf("weights.rms_ffn_weight: %f\n", context->weights.rms_ffn_weight);
+    // printf("weights.w1: %f\n", context->weights.w1);
+    // printf("weights.w2: %f\n", context->weights.w2);
+    // printf("weights.w3: %f\n", context->weights.w3);
+    // printf("weights.rms_final_weight: %f\n", context->weights.rms_final_weight);
+    // printf("weights.freq_cis_real: %f\n", context->weights.freq_cis_real);
+    // printf("weights.freq_cis_imag: %f\n", context->weights.freq_cis_imag);
+    // printf("weights.wcls: %f\n", context->weights.wcls);
+
+    Config config = context->config;
+    RunState state = context->state;
+    TransformerWeights weights = context->weights;
+    char **vocab = context->vocab;
+    float temperature = context->temperature;
+    int token = context->token;
+    int pos = context->pos;
+
+    // printf("debug tranformer call\n");
+    // printf("token: %d\n", context->token);
+    // printf("pos: %d\n", context->pos);
+    // printf("config address %p\n", config);
+    // printf("runstate address %p\n", state);
+    // printf("weights address %p\n", weights);
+
+    transformer(token, pos, &config, &state, &weights);
+    // transformer(1, 0, NULL, NULL, NULL);
+
+    // printf("\rGenerating token 2 %d/%d", context->pos, context->steps);
+    // prsintf("%d", temperature);
+    if (temperature == 0.0f)
     {
+        // printf("\rGenerating token 3 %d/%d", context->pos, context->steps);
+        next = argmax(state.logits, config.vocab_size);
+    }
+    else
+    {
+        // printf("\rGenerating token 4 %d/%d", context->pos, context->steps);
 
-        // forward the transformer to get logits for the next token
-        transformer(token, pos, &config, &state, &weights);
+        for (int q = 0; q < config.vocab_size; q++)
+        {
+            state.logits[q] /= temperature;
+        }
 
-        // sample the next token
-        if (temperature == 0.0f)
-        {
-            // greedy argmax sampling
-            next = argmax(state.logits, config.vocab_size);
-        }
-        else
-        {
-            // apply the temperature to the logits
-            for (int q = 0; q < config.vocab_size; q++)
-            {
-                state.logits[q] /= temperature;
-            }
-            // apply softmax to the logits to get the probabilities for next token
-            softmax(state.logits, config.vocab_size);
-            // we now want to sample from this distribution to get the next token
-            next = sample(state.logits, config.vocab_size);
-        }
-        // following BOS token (1), sentencepiece decoder strips any leading whitespace (see PR #89)
-        char *token_str = (token == 1 && vocab[next][0] == ' ') ? vocab[next] + 1 : vocab[next];
-        printf("%s", token_str);
-        fflush(stdout);
-
-        // advance forward
-        token = next;
-        pos++;
-        // init our timer here because the first iteration is slow due to memmap
-        if (start == 0)
-        {
-            start = time_in_ms();
-        }
+        softmax(state.logits, config.vocab_size);
+        next = sample(state.logits, config.vocab_size);
     }
 
-    // report achieved tok/s
+    // printf("\rGenerating token 5 %d/%d", context->pos, context->steps);
+
+    // printf("token: %d\n", context->token);
+    // printf("next: %d\n", next);
+    // printf("context->token: %d\n", context->token);
+    // printf("context->config.vocab_size: %d\n", context->config.vocab_size);
+    // printf("context->vocab[next][0]: %c\n", context->vocab[next][0]);
+    // printf("context->vocab[next][0]: %c\n", context->vocab[next][0]);
+    // printf("context->vocab[next]: %s\n", context->vocab[next]);
+
+    char *token_str = (token == 1 && vocab[next][0] == ' ') ? vocab[next] + 1 : vocab[next];
+
+    // printf("\rGenerating token 5.1 %d/%d", context->pos, context->steps);
+    token = next;
+    pos++;
+    context->token = token;
+    context->pos = pos;
+
+    if (context->start == 0)
+    {
+        context->start = time_in_ms();
+    }
+
+    // printf("\rGenerating token 6 %d/%d", context->pos, context->steps);
+    return token_str;
+}
+
+void report_stats(GeneratorContext *context)
+{
     long end = time_in_ms();
-    printf("\nachieved tok/s: %f\n", (steps - 1) / (double)(end - start) * 1000);
+    printf("\nachieved tok/s: %f\n", (context->steps - 1) / (double)(end - context->start) * 1000);
+}
 
-    // memory and file handles cleanup
-    free_run_state(&state);
-    for (int i = 0; i < config.vocab_size; i++)
+void cleanup(GeneratorContext *context)
+{
+    free_run_state(&context->state);
+
+    for (int i = 0; i < context->config.vocab_size; i++)
     {
-        free(vocab[i]);
+        free(context->vocab[i]);
     }
-    free(vocab);
-    if (data != MAP_FAILED)
-        munmap(data, file_size);
-    if (fd != -1)
-        close(fd);
-    return 0;
+
+    free(context->vocab);
+
+    if (context->data != MAP_FAILED)
+    {
+        munmap(context->data, context->file_size);
+    }
+
+    if (context->fd != -1)
+    {
+        close(context->fd);
+    }
+
+    free(context);
 }

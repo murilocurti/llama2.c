@@ -7,6 +7,10 @@ CC = gcc
 run: run.c
 	$(CC) -O3 -o run run.c -lm
 
+.PHONY: lib
+lib: lib.c
+	$(CC) -shared -o lib.so lib.c -lm
+
 # useful for a debug build, can then e.g. analyze with valgrind, example:
 # $ valgrind --leak-check=full ./run out/model.bin 1.0 3
 rundebug: run.c
@@ -35,6 +39,14 @@ runomp: run.c
 .PHONY: win64
 win64: 
 	x86_64-w64-mingw32-gcc -Ofast -D_WIN32 -o run.exe -I. run.c win.c
+
+.PHONY: staticlib
+staticlib:
+	ar rcs lib.a lib.o
+
+.PHONY: win64lib
+win64lib:
+	x86_64-w64-mingw32-gcc -Ofast -D_WIN32 -shared -o lib.dll lib.c win.c -lm
 
 # compiles with gnu99 standard flags for amazon linux, coreos, etc. compatibility
 .PHONY: rungnu
